@@ -208,30 +208,49 @@ func isFileType(v interface{}) bool {
 }
 
 func (c *Client) SendRequest(method string, path string, params *RequestParameters, result interface{}) error {
+	body, err := c.SendRequestAndGetJson(method, path, params, result)
+	if body == nil {
+		return err
+	}
+
+	err = json.Unmarshal(body, result)
+	if err != nil {
+		return err
+	}
+
+	errorField := reflect.ValueOf(&result).Elem().FieldByName("Error")
+	var resultError *ResultError
+	resultError = errorField.Interface().(*ResultError)
+
+	if resultError != nil && resultError.Code == 401 {
+		var nilError *ResultError
+		errorField.Set(reflect.ValueOf(nilError))
+
+		c.accessTokenData.AccessToken = ""
+
+		requestUrl, err := c.getRequestUrl(method, path, params)
+		if err != nil {
+			return err
+		}
+
+		return c.SendRequest(method, requestUrl, params, result)
+	}
+
+	return err
+}
+
+func (c *Client) SendRequestAndGetJson(method string, path string, params *RequestParameters, result interface{}) ([]byte, error) {
 	if c.requiresAccessToken() {
 		err := c.prepareAccessToken()
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	var requestBody *bytes.Buffer
 	var writer *multipart.Writer
-	queryString := ""
 	if params != nil {
-		if method == "GET" {
-			if len(*params) != 0 {
-				values := url.Values{}
-				for k, v := range *params {
-					data, err := marshal(v)
-					if err != nil {
-						return err
-					}
-					values.Add(k, string(data))
-				}
-				queryString = "?" + values.Encode()
-			}
-		} else {
+		if method != "GET" {
 			requestBody = &bytes.Buffer{}
 			writer = multipart.NewWriter(requestBody)
 			for k, v := range *params {
@@ -239,21 +258,21 @@ func (c *Client) SendRequest(method string, path string, params *RequestParamete
 					file := v.(*os.File)
 					part, err := writer.CreateFormFile(k, filepath.Base(file.Name()))
 					if err != nil {
-						return err
+						return nil, err
 					}
 
 					_, err = io.Copy(part, file)
 					if err != nil {
-						return err
+						return nil, err
 					}
 				} else {
 					data, err := marshal(v)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					err = writer.WriteField(k, string(data))
 					if err != nil {
-						return err
+						return nil, err
 					}
 				}
 			}
@@ -261,7 +280,11 @@ func (c *Client) SendRequest(method string, path string, params *RequestParamete
 		}
 	}
 
-	requestUrl := c.Opts.BaseUrl() + "/v" + c.Opts.ApiVersion() + path + queryString
+	requestUrl, err := c.getRequestUrl(method, path, params)
+	if err != nil {
+		return nil, err
+	}
+
 	req, err := (func() (*http.Request, error) {
 		if requestBody == nil {
 			return http.NewRequest(method, requestUrl, nil)
@@ -270,7 +293,7 @@ func (c *Client) SendRequest(method string, path string, params *RequestParamete
 		return http.NewRequest(method, requestUrl, requestBody)
 	})()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	client := &http.Client{}
@@ -282,29 +305,33 @@ func (c *Client) SendRequest(method string, path string, params *RequestParamete
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	return ioutil.ReadAll(resp.Body)
+}
 
-	err = json.Unmarshal(body, result)
+func (c *Client) getRequestUrl(method string, path string, params *RequestParameters) (string, error) {
+	queryString, err := c.getQueryString(method, params)
 	if err != nil {
-		return err
+		return "", err
+	}
+	return c.Opts.BaseUrl() + "/v" + c.Opts.ApiVersion() + path + queryString, nil
+}
+
+func (c *Client) getQueryString(method string, params *RequestParameters) (string, error) {
+	if method != "GET" || params == nil || len(*params) == 0 {
+		return "", nil
 	}
 
-	errorField := reflect.ValueOf(result).Elem().FieldByName("Error")
-	var resultError *ResultError
-	resultError = errorField.Interface().(*ResultError)
-
-	if resultError != nil && resultError.Code == 401 {
-		var nilError *ResultError
-		errorField.Set(reflect.ValueOf(nilError))
-
-		c.accessTokenData.AccessToken = ""
-
-		return c.SendRequest(method, requestUrl, params, result)
+	values := url.Values{}
+	for k, v := range *params {
+		data, err := marshal(v)
+		if err != nil {
+			return "", err
+		}
+		values.Add(k, string(data))
 	}
-
-	return nil
+	return "?" + values.Encode(), nil
 }
